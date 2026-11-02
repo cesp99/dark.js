@@ -38,7 +38,10 @@ export async function startServer() {
     const file = path.join(FIXTURES, path.basename(url.pathname));
     if (!fs.existsSync(file)) { res.writeHead(404); return res.end('not found'); }
     const type = TYPES[path.extname(file)] || 'application/octet-stream';
-    res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store', 'access-control-allow-origin': '*' });
+    const headers = { 'content-type': type, 'cache-control': 'no-store', 'access-control-allow-origin': '*' };
+    // ?csp=<policy> serves the page with that Content-Security-Policy (e.g. style-src 'self').
+    if (url.searchParams.has('csp')) headers['content-security-policy'] = url.searchParams.get('csp') || "style-src 'self'";
+    res.writeHead(200, headers);
     if (type.startsWith('text/html')) return res.end(fs.readFileSync(file, 'utf8').replaceAll('{{XO}}', `http://localhost:${port}`));
     fs.createReadStream(file).pipe(res);
   });

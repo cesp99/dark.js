@@ -20,7 +20,7 @@ export async function runSuite({ browser, browserName, script, label, base }) {
   /**
    * Opens a fixture in a fresh context.
    * @param {object} o  file, scheme ('light'|'dark'), start (init-script copies), end (copies after load),
-   *                    config (window.DarkJSConfig), settle (ms)
+   *                    config (window.DarkJSConfig), pre (script run before dark.js), settle (ms)
    */
   async function load(o) {
     // A navigation that never finishes is a harness hiccup (seen once in headless WebKit): retry it once.
@@ -30,10 +30,10 @@ export async function runSuite({ browser, browserName, script, label, base }) {
       return loadOnce(o);
     }
   }
-  async function loadOnce({ file, scheme = 'dark', start = 1, end = 0, config = null, settle = 700 }) {
+  async function loadOnce({ file, scheme = 'dark', start = 1, end = 0, config = null, pre = '', settle = 700 }) {
     const ctx = await browser.newContext({ colorScheme: scheme, viewport: VIEWPORT, deviceScaleFactor: 1 });
     open.push(ctx);
-    const prefix = config ? `window.DarkJSConfig = ${JSON.stringify(config)};\n` : '';
+    const prefix = (config ? `window.DarkJSConfig = ${JSON.stringify(config)};\n` : '') + (pre ? `${pre}\n` : '');
     // One init script per copy, config first (Playwright does not order separate init scripts).
     for (let i = 0; i < start; i++) await ctx.addInitScript({ content: (i === 0 ? prefix : '') + script });
     const page = await ctx.newPage();
@@ -302,6 +302,142 @@ export async function runSuite({ browser, browserName, script, label, base }) {
     await close(p);
     assert(on, 'dark mode switched off');
   });
+
+  // ---------------------------------------------------------------- engine robustness
+
+  const RED = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGklEQVR4AWN8ICDwnwEJMDGgASYGNMDEgAYAg+QCBygajHwAAAAASUVORK5CYII=';
+
+  await suite.test('content drawn over a photo layer keeps its designed colours (hero text)', async () => {
+    const p = await load({ file: 'light.html' });
+    await p.evaluate(red => {
+      const box = document.createElement('div');
+      box.id = 'cover';
+      box.style.cssText = 'position:absolute;left:600px;top:40px;width:240px;height:140px;overflow:hidden';
+      box.innerHTML = `<img alt="" src="${red}" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover">` +
+        '<div id="cover-over" style="position:absolute;left:10px;top:10px;width:100px;height:50px;background:#fff"></div>' +
+        '<h2 style="position:relative;margin:0;padding:80px 10px 0;color:#fff">Over a photo</h2>';
+      document.body.appendChild(box);
+    }, RED);
+    await sleep(900);
+    const png = await shot(p, 'cover');
+    const over = await region(p, png, '#cover-over');
+    const b = await rect(p, '#cover');
+    const photo = avgColor(png, b.x + 180, b.y + 90, 40, 30);
+    await close(p);
+    assert(isLight(over) && isReddish(photo), `overlay ${rgb(over)} photo ${rgb(photo)}`);
+    return `overlay ${rgb(over)} photo ${rgb(photo)}`;
+  });
+
+  await suite.test('raster thumbnails of SVGs (Wikimedia .svg.png) follow the page; photos do not', async () => {
+    const p = await load({ file: 'light.html' });
+    const f = await call(p, () => ['/w/thumb/a/ab/Euler.svg/250px-Euler.svg.png', '/w/thumb/c/cd/Photo.jpg/250px-Photo.jpg'].map(src => {
+      const i = document.createElement('img'); i.src = src; i.alt = ''; document.body.appendChild(i);
+      const v = getComputedStyle(i).filter; i.remove(); return v;
+    }));
+    await close(p);
+    assert(f[0] === 'none' && f[1] !== 'none', `svg thumb filter=${f[0]} photo thumb filter=${f[1]}`);
+  });
+
+  await suite.test('translucent black modal scrim dims the dark page (no white haze)', async () => {
+    const p = await load({ file: 'light.html' });
+    const before = pageBg(await shot(p, 'scrim-before'));
+    await call(p, () => {
+      const d = document.createElement('div');
+      d.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50';
+      document.body.appendChild(d);
+    });
+    await sleep(900);
+    const after = pageBg(await shot(p, 'scrim'));
+    await close(p);
+    assert(isDark(after) && after[0] <= before[0], `page under the scrim ${rgb(after)}, without ${rgb(before)}`);
+    return `${rgb(before)} -> ${rgb(after)}`;
+  });
+
+  await suite.test('page CSP without unsafe-inline: still darkened (constructed stylesheet)', async () => {
+    const p = await load({ file: `light.html?csp=${encodeURIComponent("style-src 'self'")}` });
+    await p.evaluate(red => {
+      const host = document.createElement('div');
+      host.id = 'csp-host';
+      const img = document.createElement('img');
+      img.src = red; img.alt = ''; img.style.width = '200px'; img.style.height = '110px'; img.style.display = 'block';
+      host.attachShadow({ mode: 'open' }).appendChild(img);
+      document.body.prepend(host);
+    }, RED);
+    await sleep(900);
+    const png = await shot(p, 'csp');
+    const bg = pageBg(png);
+    const st = await call(p, () => window.DarkJS.state());
+    const hb = await rect(p, '#csp-host');
+    const shImg = avgColor(png, hb.x + 40, hb.y + 30, 120, 50);
+    await close(p);
+    assert(isDark(bg) && st.enabled && st.reason !== 'csp-blocked', `page ${rgb(bg)} state ${JSON.stringify(st)}`);
+    assert(isReddish(shImg), `<img> in a shadow root ${rgb(shImg)}`);
+    return `bg ${rgb(bg)}, shadow img ${rgb(shImg)}`;
+  });
+
+  await suite.test('page CSP and no constructable stylesheets: reports csp-blocked instead of enabled', async () => {
+    const p = await load({ file: `light.html?csp=${encodeURIComponent("style-src 'self'")}`, pre: 'window.CSSStyleSheet = undefined;' });
+    const st = await call(p, () => [window.DarkJS.state(), window.DarkJS.isEnabled(), window.toggleDarkMode(true)]);
+    await close(p);
+    assert(st[0].reason === 'csp-blocked' && !st[0].enabled && st[1] === false && st[2] === false, JSON.stringify(st));
+  });
+
+  await suite.test('toggleDarkMode(true) forces a natively dark page, toggleDarkMode() undoes it', async () => {
+    const p = await load({ file: 'dark-native.html' });
+    const r1 = await call(p, () => [window.toggleDarkMode(true), window.DarkJS.isEnabled()]);
+    await sleep(150);
+    const bg1 = pageBg(await shot(p, 'force-toggle-on'));
+    const r2 = await call(p, () => [window.toggleDarkMode(), window.DarkJS.isEnabled()]);
+    await sleep(150);
+    const bg2 = pageBg(await shot(p, 'force-toggle-off'));
+    await close(p);
+    assert(r1.join() === 'true,true' && isLight(bg1), `toggleDarkMode(true) -> ${r1}, page ${rgb(bg1)}`);
+    assert(r2.join() === 'false,false' && isDark(bg2), `toggleDarkMode() -> ${r2}, page ${rgb(bg2)}`);
+  });
+
+  await suite.test('a leftover engine <style> from an earlier copy is cleaned up', async () => {
+    const p = await load({ file: 'light.html', scheme: 'light' });
+    const n = await call(p, () => {
+      const st = document.createElement('style');
+      st.id = 'dark-by-eyed'; st.setAttribute('data-dark', 'engine');
+      st.textContent = ':root{filter:invert(1)!important}';
+      document.documentElement.appendChild(st);
+      window.DarkJS.enable();
+      const on = document.querySelectorAll('style#dark-by-eyed').length;
+      window.DarkJS.disable();
+      return [on, document.querySelectorAll('style#dark-by-eyed').length];
+    });
+    await sleep(150);
+    const bg = pageBg(await shot(p, 'orphan'));
+    await close(p);
+    assert(n.join() === '1,0' && isLight(bg), `styles while on/off ${n}, page ${rgb(bg)}`);
+  });
+
+  if (browserName === 'chromium') {
+    await suite.test('detached shadow trees are not kept alive by the engine', async () => {
+      const p = await load({ file: 'light.html' });
+      await call(p, () => {
+        const box = document.createElement('div');
+        box.id = 'churn';
+        for (let i = 0; i < 300; i++) {
+          const h = document.createElement('div');
+          h.attachShadow({ mode: 'open' }).innerHTML = '<span>card</span><img alt="">';
+          box.appendChild(h);
+        }
+        document.body.appendChild(box);
+      });
+      await sleep(1200);
+      const live = () => call(p, () => window.DarkJS.engine.shadowRefs.filter(r => (r.deref ? r.deref() : r)).length);
+      const before = await live();
+      await call(p, () => document.getElementById('churn').remove());
+      const cdp = await p.context().newCDPSession(p);
+      for (let i = 0; i < 3; i++) { await cdp.send('HeapProfiler.collectGarbage'); await sleep(100); }
+      const after = await live();
+      await close(p);
+      assert(before >= 300 && after < 30, `styled shadow roots alive: ${before} before, ${after} after removal + GC`);
+      return `${before} -> ${after}`;
+    });
+  }
 
   // ---------------------------------------------------------------- v2 API
 

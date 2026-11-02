@@ -42,6 +42,7 @@
 
   let started = false;        // nothing happens before auto-init or the first API call
   let manual = null;          // null: follow the OS theme; true / false: set by a call
+  let forced = false;         // an explicit "on" call: darken even a page that looks natively dark
   let nativeDetected = false; // the page ships its own dark theme
   let reason = 'idle';
   let lastSystem = null;      // OS theme seen by the last decision
@@ -57,8 +58,8 @@
     return p;
   };
   const wanted = () => (manual !== null ? manual : !!config.followSystem && systemDark());
-  /** The state callers see: nothing is dark before the controller started (auto: false). */
-  const current = () => started && wanted();
+  /** The state callers see: whether the page is being darkened (never before the controller started). */
+  const current = () => started && engine.isEnabled();
 
   function looksNativeDark() {
     if (!doc.body) return false;
@@ -70,22 +71,25 @@
     if (!started) return;
     lastSystem = systemDark();
     const want = wanted();
-    if (want && recheck && config.detectDark && !nativeDetected && looksNativeDark()) nativeDetected = true;
-    const on = want && !(config.detectDark && nativeDetected);
+    const respectNative = config.detectDark && !(forced && manual === true);
+    if (want && recheck && respectNative && !nativeDetected && looksNativeDark()) nativeDetected = true;
+    const on = want && !(respectNative && nativeDetected);
     reason = on ? (manual !== null ? 'manual' : 'system')
       : want ? 'native-dark'
       : manual !== null ? 'manual' : config.followSystem ? 'system' : 'off';
     if (on) {
+      // On a page whose CSP blocks inline styles, in an engine without constructable stylesheets
+      // (iOS < 16.4), the engine stays blocked: isEnabled() is false and state().reason 'csp-blocked'.
       if (engine.isEnabled()) engine.update(params());
       else engine.enable(params());
-    } else if (engine.isEnabled()) {
+    } else if (engine.isEnabled() || engine.isBlocked()) {
       engine.disable();
     }
   }
 
   /** Runs at each stage of the page load: themes can appear late (scripts, async stylesheets). */
   function detect() {
-    if (!started || nativeDetected || !config.detectDark || !wanted()) return;
+    if (!started || nativeDetected || !config.detectDark || (forced && manual === true) || !wanted()) return;
     if (looksNativeDark()) {
       nativeDetected = true;
       apply(false);
@@ -124,7 +128,7 @@
   function onSchemeChange() {
     if (!started || systemDark() === lastSystem) return; // WebKit's late first 'change' is not a change
     // v1 behaviour: the OS theme wins over an earlier manual toggle while following the system.
-    if (config.followSystem) manual = null;
+    if (config.followSystem) { manual = null; forced = false; }
     // Sites whose own theme follows the OS may have switched with it: look again once their scripts ran.
     nativeDetected = false;
     apply(true);
@@ -151,16 +155,18 @@
   }
 
   function setFollow(on) {
-    if (on) manual = null;
+    if (on) { manual = null; forced = false; }
     else if (manual === null) manual = wanted(); // keep what the page looks like right now
     config.followSystem = on;
   }
 
+  /** An explicit call: `true` darkens the page even if it looks natively dark (v1 always did). */
   function set(on) {
     start();
     manual = !!on;
+    forced = !!on;
     apply(true);
-    return wanted();
+    return current();
   }
 
   const DarkJS = {
@@ -177,7 +183,7 @@
       return DarkJS;
     },
     /** Whether the page is being darkened right now (false on a page that is dark by itself). */
-    isEnabled() { return engine.isEnabled(); },
+    isEnabled() { return started && engine.isEnabled(); },
     /** Follow the OS theme (true), or keep the current state regardless of it (false). */
     followSystem(on) {
       setFollow(on === undefined ? true : !!on);
@@ -187,9 +193,10 @@
     },
     state() {
       return {
-        enabled: engine.isEnabled(), wanted: current(), nativeDark: nativeDetected,
+        enabled: current(), wanted: started && wanted(), nativeDark: nativeDetected,
         systemDark: systemDark(), followSystem: !!config.followSystem, detectDark: !!config.detectDark,
-        params: params(), reason,
+        // Enabling may complete later (WebKit at document start mounts once <html> exists).
+        params: params(), reason: engine.isBlocked() ? 'csp-blocked' : reason,
       };
     },
     engine,

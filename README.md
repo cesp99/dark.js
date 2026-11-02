@@ -21,7 +21,7 @@ It only runs in the top frame. The filter on the page already covers its iframes
 
 ### API
 
-`window.toggleDarkMode(force)` works exactly as in v1:
+`window.toggleDarkMode(force)` works as in v1:
 
 ```js
 toggleDarkMode(true);  // dark
@@ -29,17 +29,21 @@ toggleDarkMode(false); // light
 toggleDarkMode();      // flip
 ```
 
+An explicit "on" (`toggleDarkMode(true)`, `DarkJS.enable()`) darkens the page even when it looks natively
+dark, like v1 did. Only the automatic, OS-driven decision skips natively dark pages. Unlike v1, the calls
+return whether the page is darkened afterwards.
+
 `window.DarkJS` adds a bit more control:
 
 | Method | |
 |---|---|
 | `DarkJS.enable(opts?)` | Switch dark mode on. `opts` may carry `brightness`, `contrast`, `sepia`, `detectDark` |
 | `DarkJS.disable()` | Switch it off |
-| `DarkJS.toggle(force?)` | `true` / `false` force a state, anything else flips it. Returns the new state |
+| `DarkJS.toggle(force?)` | `true` / `false` force a state, anything else flips what the page shows. Returns whether the page is darkened |
 | `DarkJS.configure(opts)` | Change any option below, in place |
-| `DarkJS.isEnabled()` | Whether the page is being darkened right now (`false` on a page that is dark by itself) |
+| `DarkJS.isEnabled()` | Whether the page is being darkened right now (`false` on a page that is dark by itself, or when the page blocks styles) |
 | `DarkJS.followSystem(bool)` | Follow the OS theme (`true`), or keep the current state whatever the OS does (`false`) |
-| `DarkJS.state()` | `{ enabled, wanted, nativeDark, systemDark, followSystem, detectDark, params, reason }` |
+| `DarkJS.state()` | `{ enabled, wanted, nativeDark, systemDark, followSystem, detectDark, params, reason }`; `reason` is `'system'`, `'manual'`, `'native-dark'`, `'off'` or `'csp-blocked'` |
 
 While following the system, an OS theme change wins over an earlier manual toggle (same as v1).
 
@@ -129,5 +133,8 @@ Add the script to your browser's userscript manager (run it at `document-start`)
 
 ## Compatibility
 
-Tested on WebKit (Safari 27 engine) and Chromium. It needs Safari 14 / iOS 14 or newer. Keeping media
-colours inside nested backgrounds needs CSS nesting (Safari 16.5, Chrome 112).
+Tested on WebKit (Safari 27 engine) and Chromium. It needs Safari 14 / iOS 14 or newer.
+
+Pages whose Content-Security-Policy blocks inline styles (`style-src` without `'unsafe-inline'`) are darkened
+through a constructed stylesheet, which needs Safari 16.4 / iOS 16.4. On older versions such pages stay
+light, and `DarkJS.state().reason` is `'csp-blocked'`.

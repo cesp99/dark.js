@@ -29,7 +29,8 @@
   if (global.DarkEngine) return;
 
   const STYLE_ID = 'dark-by-eyed';
-  const BG_ATTR = 'data-dark-bg';
+  const BG_ATTR = 'data-dark-bg';        // '' = photo background, 'cover' = box covered by a photo/video
+  const SCRIM_ATTR = 'data-dark-scrim';  // translucent black dimming layer (modal / consent backdrop)
   const XHTML = 'http://www.w3.org/1999/xhtml';
   // White becomes #121212 (not pure black: softer, and leaves room for the brightness slider) and black
   // becomes #ededed. Media gets the exact inverse: invert(1) hue-rotate(180deg) contrast(1/(2·DEPTH−1))
@@ -50,10 +51,14 @@
   const LIMITS = { brightness: [0, 300], contrast: [0, 300], sepia: [0, 100] };
 
   const MAX_BG_SELECTORS = 1500;   // photo-background selectors emitted as CSS
-  const MAX_ANCESTOR_SELECTORS = 200; // of which may act as "already re-inverted" ancestors
+  const MAX_ANCESTOR_SELECTORS = 100; // of which may act as "already re-inverted" ancestors
   const MAX_RULES_PER_PASS = 60000;
   const MAX_SCAN_ELEMENTS = 20000; // per element pass
   const MAX_PENDING_ROOTS = 3000;
+  const MAX_ROOT_ELEMENTS = 400;   // per added subtree
+  const MAX_ADOPT_PER_TICK = 100;  // shadow roots styled per idle tick (their style cost lands in the next frame)
+  const CONTINUE_MS = 100;         // idle-callback timeouts (see schedule())
+  const NEW_CONTENT_MS = 500;
   const DARK_LUM = 0.18;
 
   // Iframes that embed video or maps (pixels, not UI) keep their colours.
@@ -64,8 +69,11 @@
   ].map(s => `iframe[src*="${s}"]`);
 
   // SVG images are nearly always logos, icons, diagrams or formulas drawn in dark ink on transparency:
-  // re-inverting them would put dark ink on a dark page, so they follow the page instead.
-  const NOT_SVG = ':not([src$=".svg" i]):not([src*=".svg?" i]):not([src*=".svg#" i]):not([src*="/svg/" i])';
+  // re-inverting them would put dark ink on a dark page, so they follow the page instead. That includes
+  // raster thumbnails of SVGs (Wikimedia: ".../Diagram.svg/250px-Diagram.svg.png").
+  const SVG_SRC = ['.svg"', '.svg?', '.svg#', '/svg/', '.svg/', '.svg.png'];
+  const NOT_SVG = SVG_SRC.map(s => s === '.svg"' ? ':not([src$=".svg" i])' : `:not([src*="${s}" i])`).join('');
+  const SVG_SRC_RE = /\.svg($|[?#/]|\.png)|\/svg\//i;
 
   /** Leaf media that must keep original colours. <picture> is not listed: its <img> is. */
   const MEDIA = [`img${NOT_SVG}`, `input[type="image" i]${NOT_SVG}`, 'video', 'image', 'embed', 'object', ...MEDIA_IFRAMES];
@@ -75,8 +83,11 @@
   const INLINE_BG = ':not(html,body)[style*="url(" i][style*="background" i]:not([style*="svg" i])';
   /** Re-inverted elements that can have descendants. */
   const CONTAINERS = ['video', 'object', `[${BG_ATTR}]`, INLINE_BG, ...EXEMPT];
-  const BASE_TARGETS = [...MEDIA, `[${BG_ATTR}]`, INLINE_BG, ...EXEMPT];
-  const TOP_LAYER = ':fullscreen,:modal,:popover-open';
+  const BASE_TARGETS = [...MEDIA, `[${BG_ATTR}]`, `[${SCRIM_ATTR}]`, INLINE_BG, ...EXEMPT];
+  // A forgiving :is() list: an engine that does not know one of these (:popover-open before Safari 17 /
+  // Chrome 114) skips just that pseudo-class instead of dropping the whole rule.
+  const TOP_LAYER = ':is(:fullscreen,:-webkit-full-screen,:modal,:popover-open)';
+  const NONE = `{filter:none${IMP}}`;
   // WebKit ignores CSS filter functions on SVG child elements, so an SVG <image> cannot be re-inverted
   // itself: re-invert the outermost <svg> that contains one. hanging-punctuation is WebKit-only.
   const WEBKIT = '(hanging-punctuation:first) and (not (-moz-orient:inline))';
@@ -84,6 +95,8 @@
 
   const SKIP_SCAN_TAGS = new Set(['SCRIPT', 'STYLE', 'LINK', 'META', 'HEAD', 'TITLE', 'NOSCRIPT', 'TEMPLATE',
     'IMG', 'VIDEO', 'PICTURE', 'SOURCE', 'IFRAME', 'EMBED', 'OBJECT', 'CANVAS', 'BR', 'svg', 'SVG', 'path']);
+  // Children that do not paint anything next to a media element (<picture> sources, fallbacks).
+  const MEDIA_COMPANIONS = new Set(['SOURCE', 'TRACK', 'NOSCRIPT', 'SCRIPT', 'TEMPLATE', 'BR']);
   const MEDIA_TAGS = new Set(['IMG', 'VIDEO', 'CANVAS', 'IFRAME', 'EMBED', 'OBJECT', 'PICTURE', 'svg', 'SVG', 'image']);
 
   // ------------------------------------------------------------------ pure helpers
@@ -218,6 +231,33 @@
     return out;
   }
 
+  /**
+   * "Never invert twice": targets inside an already re-inverted ancestor get filter:none. Written as flat
+   * `:is(ancestors) target` selectors, one per target, so every selector is bucketed by its own subject
+   * (CSS nesting or an `:is(targets)` subject would be matched against every element on every style
+   * recalculation, and engines without nesting would drop the guard entirely). The full target selector
+   * keeps the guard more specific than the rule that re-inverts the target.
+   */
+  function guardRule(ancestors, targets) {
+    const anc = `:is(${ancestors.join(',')})`;
+    return targets.map(t => `${anc} ${t}`).join(',') + NONE;
+  }
+
+  /** Overlap area of two DOMRects. */
+  function overlap(a, b) {
+    const w = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+    const h = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+    return w > 0 && h > 0 ? w * h : 0;
+  }
+
+  /** Whether `el` holds nothing but `child` (and sources / fallbacks): a <picture>, a link around an image. */
+  function onlyWraps(el, child) {
+    for (const c of el.children) if (c !== child && !MEDIA_COMPANIONS.has(c.nodeName)) return false;
+    return !el.textContent.trim();
+  }
+
+  const WeakRefImpl = typeof WeakRef === 'function' ? WeakRef : null;
+
   const onlyDark = v => /\bdark\b/.test(v || '') && !/\blight\b/.test(v || '');
 
   // ------------------------------------------------------------------ engine
@@ -230,7 +270,9 @@
       this.win = win;
       this.enabled = false;
       this.params = clampParams(DEFAULTS);
-      this.style = null;
+      this.style = null;             // our <style> element
+      this.adopted = null;           // constructed sheet used instead when the page CSP blocks inline styles
+      this.blocked = false;          // neither works (CSP without constructable stylesheets)
       this.canvasMode = 'soft';      // 'soft' | 'off' | 'force'
       this.canvasTone = 'light';
       this.bgSelectors = new Set();  // harvested photo-background selectors
@@ -239,8 +281,14 @@
       this.needElementScan = false;  // cross-origin sheets / var() backgrounds we could not read
       this.scannedAll = false;
       this.pendingRoots = new Set();
+      this.rootWalker = null;        // walk of one added subtree, resumable across ticks
+      this.writes = [];              // attribute changes queued during a walk, applied after its reads
+      this.tickAdopted = 0;
+      this.ancestorCount = 0;        // harvested selectors used as guard ancestors so far
       this.shadowRoots = new WeakSet();
-      this.shadowStyles = new Set();
+      this.shadowRefs = [];          // weak refs to the <style>s (or roots) we styled; never keeps a tree alive
+      this.shadowSheet = null;
+      this.pruneAt = 256;
       this.customSeen = new WeakSet();
       this.customRetried = new WeakSet();
       this.customPending = new Set();
@@ -255,7 +303,14 @@
       this.tick = this.tick.bind(this);
     }
 
-    isEnabled() { return this.enabled; }
+    /** Whether the page is being darkened (false while the page CSP blocks every way to add styles). */
+    isEnabled() { return this.enabled && !this.blocked; }
+
+    /** Whether enabling failed because the page's Content-Security-Policy blocks our styles. */
+    isBlocked() { return this.enabled && this.blocked; }
+
+    /** The CSSStyleSheet we write to, or null. */
+    sheet() { return this.adopted || (this.style && this.style.sheet) || null; }
 
     enable(options) {
       if (options) this.params = clampParams(Object.assign({}, this.params, options));
@@ -288,9 +343,16 @@
       this.cancelIdle();
       if (this.style) this.style.remove();
       this.style = null;
+      if (this.adopted) {
+        try { doc.adoptedStyleSheets = doc.adoptedStyleSheets.filter(s => s !== this.adopted); } catch { /* gone */ }
+      }
+      this.adopted = null;
+      this.blocked = false;
       for (const el of doc.querySelectorAll(`[${BG_ATTR}]`)) el.removeAttribute(BG_ATTR);
-      for (const st of this.shadowStyles) st.remove();
-      this.shadowStyles.clear();
+      for (const el of doc.querySelectorAll(`[${SCRIM_ATTR}]`)) el.removeAttribute(SCRIM_ATTR);
+      for (const ref of this.shadowRefs) this.unstyleShadow(WeakRefImpl ? ref.deref() : ref);
+      this.shadowRefs = [];
+      this.shadowSheet = null;
       this.shadowRoots = new WeakSet();
       this.customSeen = new WeakSet();
       this.customRetried = new WeakSet();
@@ -299,6 +361,8 @@
       this.customTimer = 0;
       this.scannedAll = false;
       this.walker = null;
+      this.rootWalker = null;
+      this.writes = [];
       this.pendingRoots.clear();
       return this;
     }
@@ -317,16 +381,27 @@
         return;
       }
       if (root.namespaceURI !== XHTML) return; // SVG / XML documents are left alone
-      if (!this.style) {
-        this.style = doc.createElement('style');
-        this.style.id = STYLE_ID;
-        this.style.setAttribute('data-dark', 'engine');
-        // Never print inverted pages, and leave Windows high-contrast palettes alone.
-        this.style.media = this.mediaQuery();
-      }
+      // A previous instance whose script context is gone (Firefox keeps the DOM changes of an updated or
+      // reinstalled extension and injects the new version into open tabs) would keep the page inverted.
+      for (const st of doc.querySelectorAll(`style#${STYLE_ID}, style[data-dark="engine"]`)) if (st !== this.style) st.remove();
       this.guessCanvas();
-      this.style.textContent = this.css();
-      root.appendChild(this.style);
+      if (!this.adopted) {
+        if (!this.style) {
+          this.style = doc.createElement('style');
+          this.style.id = STYLE_ID;
+          this.style.setAttribute('data-dark', 'engine');
+          // Never print inverted pages, and leave Windows high-contrast palettes alone.
+          this.style.media = this.mediaQuery();
+        }
+        this.style.textContent = this.css();
+        root.appendChild(this.style);
+        // A page CSP without 'unsafe-inline' blocks the element (no sheet): fall back to a constructed sheet.
+        if (!this.style.sheet) this.adopt();
+        if (this.blocked) return; // nothing can be styled: no observers, no work
+      } else {
+        this.render();
+        this.keepAdopted();
+      }
 
       // Keep our <style> attached (some frameworks re-render <html>'s children) and notice <body>. While the
       // parser is running only <html>'s children are observed; the subtree is watched from DOMContentLoaded.
@@ -351,15 +426,45 @@
       this.schedule();
     }
 
+    /** Constructable stylesheets are not subject to CSP (Chromium, Firefox, Safari 16.4+). */
+    adopt() {
+      const { doc, win } = this;
+      const css = this.css();
+      if (this.style) { this.style.remove(); this.style = null; }
+      try {
+        const sheet = new win.CSSStyleSheet({ media: this.mediaQuery() });
+        sheet.replaceSync(css);
+        doc.adoptedStyleSheets = [...doc.adoptedStyleSheets, sheet];
+        this.adopted = sheet;
+        this.cssText = css;
+      } catch {
+        this.blocked = true;
+      }
+    }
+
+    keepAdopted() {
+      const { doc } = this;
+      try {
+        if (this.adopted && !doc.adoptedStyleSheets.includes(this.adopted)) doc.adoptedStyleSheets = [...doc.adoptedStyleSheets, this.adopted];
+      } catch { /* not supported */ }
+    }
+
     onLoadCapture(e) {
       const t = e.target;
-      if (t && t.nodeName === 'LINK') { this.scanSheets(8); this.schedule(); }
+      if (!t) return;
+      if (t.nodeName === 'LINK') { this.scanSheets(8); this.schedule(); }
+      // An image that just loaded may now cover its box (its size was unknown while it was loading).
+      else if (t.nodeName === 'IMG' && (this.scannedAll || this.walker) && this.pendingRoots.size < MAX_PENDING_ROOTS) {
+        this.pendingRoots.add(t);
+        this.schedule(NEW_CONTENT_MS);
+      }
     }
 
     onMutations(records) {
       if (!this.enabled) return;
       const { doc } = this;
       if (this.style && !this.style.isConnected && doc.documentElement) doc.documentElement.appendChild(this.style);
+      else if (this.adopted) this.keepAdopted();
       if (!this.bodySeen && doc.body) { this.bodySeen = true; this.scanSheets(8); } // <head> is complete
       // New <style>/<link> elements show up as a different sheet count: no per-node work needed.
       const count = doc.styleSheets.length;
@@ -373,7 +478,7 @@
           }
         }
       }
-      this.schedule();
+      this.schedule(NEW_CONTENT_MS);
     }
 
     // ---------------------------------------------------------------- CSS
@@ -381,8 +486,8 @@
     // Rule layout of our sheet (indices are relied upon for in-place CSSOM updates):
     //   0 :root filter + viewport scrollbar      3 leaf media / exempt / inline photo backgrounds
     //   1 body scrollbar reset                    4 @supports (Chromium top layer)   5 @supports (Firefox backdrop)
-    //   2 canvas background                       6 @supports (WebKit SVG <image>)
-    //   7… harvested photo-background chunks, last: nesting guard
+    //   2 canvas background                       6 @supports (WebKit SVG <image>)   7 nesting guard (built-in containers)
+    //   8… harvested photo-background chunks and their guards (appended as selectors are found)
     css() {
       const F = rootFilter(this.params);
       const rules = [
@@ -394,13 +499,15 @@
         `${BASE_TARGETS.join(',')}{filter:${INVERT}${IMP}}`,
         // Chromium paints the top layer outside the root filter: give it its own (Firefox already filters it).
         `@supports not (-moz-orient:inline){${TOP_LAYER}{filter:${F}${IMP}}` +
-          `${MEDIA.flatMap(m => TOP_LAYER.split(',').map(t => m + t)).join(',')}{filter:none${IMP}}}`,
+          `${MEDIA.map(m => m + TOP_LAYER).join(',')}${NONE}}`,
         // Firefox does filter the top layer, so dialog backdrops would turn into a white haze: keep them as designed.
         `@supports (-moz-orient:inline){::backdrop{filter:${INVERT}${IMP}}}`,
-        `@supports ${WEBKIT}{${SVG_WITH_IMAGE}{filter:${INVERT}${IMP}}:is(${CONTAINERS.join(',')}) ${SVG_WITH_IMAGE}{filter:none${IMP}}}`,
-        ...bgChunks([...this.bgSelectors]),
-        this.nestingRule(),
+        `@supports ${WEBKIT}{${SVG_WITH_IMAGE}{filter:${INVERT}${IMP}}:is(${CONTAINERS.join(',')}) ${SVG_WITH_IMAGE}${NONE}}`,
+        guardRule(CONTAINERS, BASE_TARGETS),
       ];
+      this.ancestorCount = 0;
+      const harvested = [...this.bgSelectors];
+      rules.push(...bgChunks(harvested), ...this.harvestedGuards(harvested));
       this.bgRendered = this.bgSelectors.size;
       return rules.join('\n');
     }
@@ -412,19 +519,26 @@
       return ':where(html){}';
     }
 
-    /** Anything inside an already re-inverted element must not be inverted a second time. */
-    nestingRule() {
-      const harvested = [...this.bgSelectors];
-      const ancestors = CONTAINERS.concat(harvested.filter(x => !hasPseudoElement(x)).slice(0, MAX_ANCESTOR_SELECTORS));
-      // CSS nesting keeps this linear in size; each "& target" is still bucketed by its own subject.
-      return `:is(${ancestors.join(',')}){${BASE_TARGETS.concat(harvested).map(t => `& ${t}`).join(',')}{filter:none${IMP}}}`;
+    /**
+     * Guards for newly harvested photo-background selectors: media inside them is not inverted twice
+     * (the first MAX_ANCESTOR_SELECTORS act as ancestors), and they are not inverted twice inside a
+     * built-in container. A photo background inside another harvested photo background is not covered.
+     */
+    harvestedGuards(fresh) {
+      const out = [];
+      const room = MAX_ANCESTOR_SELECTORS - this.ancestorCount;
+      const ancestors = room > 0 ? fresh.filter(x => !hasPseudoElement(x)).slice(0, room) : [];
+      this.ancestorCount += ancestors.length;
+      if (ancestors.length) out.push(guardRule(ancestors, BASE_TARGETS));
+      for (let i = 0; i < fresh.length; i += 300) out.push(guardRule(CONTAINERS, fresh.slice(i, i + 300)));
+      return out;
     }
 
     /** Changes filter parameters in place via CSSOM (no re-parse, no flicker). */
     applyParams() {
       const F = rootFilter(this.params);
       try {
-        const rules = this.style.sheet.cssRules;
+        const rules = this.sheet().cssRules;
         rules[0].style.setProperty('filter', F, 'important');
         rules[4].cssRules[0].style.setProperty('filter', F, 'important');
       } catch (e) {
@@ -437,7 +551,7 @@
       this.canvasMode = mode;
       this.canvasTone = tone;
       try {
-        const sheet = this.style.sheet;
+        const sheet = this.sheet();
         sheet.deleteRule(2);
         sheet.insertRule(this.canvasRule(), 2);
       } catch (e) {
@@ -445,26 +559,28 @@
       }
     }
 
-    /** Appends rules for newly harvested selectors instead of re-parsing the whole sheet. */
+    /** Appends rules for newly harvested selectors (never re-parses or re-inserts existing rules). */
     syncBackgrounds() {
-      if (!this.style || this.bgSelectors.size === this.bgRendered) return;
+      if ((!this.style && !this.adopted) || this.bgSelectors.size === this.bgRendered) return;
       const fresh = [...this.bgSelectors].slice(this.bgRendered);
       this.bgRendered = this.bgSelectors.size;
       try {
-        const sheet = this.style.sheet;
-        const last = sheet.cssRules[sheet.cssRules.length - 1];
-        if (last && String(last.selectorText).startsWith(':is(')) sheet.deleteRule(sheet.cssRules.length - 1);
-        for (const rule of bgChunks(fresh)) sheet.insertRule(rule, sheet.cssRules.length);
-        sheet.insertRule(this.nestingRule(), sheet.cssRules.length);
+        const sheet = this.sheet();
+        for (const rule of [...bgChunks(fresh), ...this.harvestedGuards(fresh)]) sheet.insertRule(rule, sheet.cssRules.length);
       } catch (e) {
         this.render();
       }
     }
 
     render() {
-      if (!this.enabled || !this.style) return;
-      const text = this.css();
-      if (this.style.textContent !== text) this.style.textContent = text;
+      if (!this.enabled || this.blocked) return;
+      if (this.adopted) {
+        const text = this.css();
+        if (text !== this.cssText) { this.cssText = text; this.adopted.replaceSync(text); }
+      } else if (this.style) {
+        const text = this.css();
+        if (this.style.textContent !== text) this.style.textContent = text;
+      }
     }
 
     // ---------------------------------------------------------------- canvas
@@ -552,7 +668,7 @@
       const deadline = performance.now() + budgetMs;
       const before = this.bgSelectors.size;
       let visited = 0, done = true;
-      const ownSheet = this.style && this.style.sheet;
+      const ownSheet = this.sheet();
       const sheets = Array.from(doc.styleSheets || []);
       try { if (doc.adoptedStyleSheets) sheets.push(...doc.adoptedStyleSheets); } catch { /* not exposed */ }
 
@@ -587,7 +703,7 @@
         if (sheet) this.ruleCounts.set(sheet, rules.length);
       }
       if (this.bgSelectors.size !== before) this.syncBackgrounds();
-      if (!done) this.schedule();
+      if (!done) this.schedule(CONTINUE_MS);
       this.sheetsPending = !done;
       return done;
     }
@@ -610,11 +726,15 @@
 
     // ---------------------------------------------------------------- idle work
 
-    schedule() {
+    /**
+     * @param {number} timeout ms after which the work runs even if the page never goes idle: short for
+     *   the rest of a walk that ran out of time and for new content, long for the initial passes.
+     */
+    schedule(timeout = 1500) {
       if (this.idleHandle || !this.enabled) return;
       const w = this.win;
       if (typeof w.requestIdleCallback === 'function') {
-        this.idleHandle = w.requestIdleCallback(this.tick, { timeout: 1500 });
+        this.idleHandle = w.requestIdleCallback(this.tick, { timeout });
         this.idleKind = 'idle';
       } else {
         this.idleHandle = w.setTimeout(() => this.tick({ timeRemaining: () => 8, didTimeout: true }), 60);
@@ -641,62 +761,145 @@
       }
       if (this.doc.readyState === 'loading') return; // full element pass waits for the document
       const end = performance.now() + budget();
-      if (!this.scannedAll) {
-        if (!this.walker) {
-          this.walker = this.doc.createTreeWalker(this.doc.body || this.doc.documentElement, 1);
-          this.walked = 0;
-          this.pendingRoots.clear();
+      this.tickAdopted = 0;
+      try {
+        if (!this.scannedAll) {
+          if (!this.walker) {
+            this.walker = this.doc.createTreeWalker(this.doc.body || this.doc.documentElement, 1);
+            this.walked = 0;
+            this.pendingRoots.clear();
+            this.rootWalker = null;
+          }
+          if (!this.walk(this.walker, end, true)) { this.schedule(CONTINUE_MS); return; }
+          this.walker = null;
+          this.scannedAll = true;
         }
-        if (!this.walk(this.walker, end, true)) { this.schedule(); return; }
-        this.walker = null;
-        this.scannedAll = true;
-      }
-      while (this.pendingRoots.size) {
-        if (performance.now() > end) { this.schedule(); return; }
-        const root = this.pendingRoots.values().next().value;
-        this.pendingRoots.delete(root);
-        if (!root.isConnected) continue;
-        this.walk(this.doc.createTreeWalker(root, 1), Infinity, false, 400);
+        while (this.rootWalker || this.pendingRoots.size) {
+          if (performance.now() > end) { this.schedule(CONTINUE_MS); return; }
+          if (!this.rootWalker) {
+            const root = this.pendingRoots.values().next().value;
+            this.pendingRoots.delete(root);
+            if (!root.isConnected) continue;
+            this.rootWalker = this.doc.createTreeWalker(root, 1);
+            this.rootLeft = MAX_ROOT_ELEMENTS;
+            this.inspect(root);
+          }
+          if (!this.walk(this.rootWalker, end, false)) { this.schedule(CONTINUE_MS); return; }
+          this.rootWalker = null;
+        }
+      } finally {
+        this.flushWrites();
       }
     }
 
-    /** Walks elements: finds shadow roots and (when stylesheets were unreadable) photo backgrounds. */
-    walk(walker, end, counted, cap = Infinity) {
-      let n = 0;
-      let el = walker.currentNode;
-      if (el && el.nodeType === 1 && !counted) this.inspect(el);
-      while ((el = walker.nextNode())) {
-        this.inspect(el);
-        if (++n >= cap) return true;
+    /**
+     * Walks elements: finds shadow roots, media covering a box, dimming scrims and (when stylesheets were
+     * unreadable) photo backgrounds. Returns false when it ran out of time (resume with the same walker).
+     */
+    walk(walker, end, counted) {
+      let n = 0, el;
+      while (counted || this.rootLeft-- > 0) {
+        if (!(el = walker.nextNode())) return true;
+        const measured = this.inspect(el);
         if (counted && ++this.walked >= MAX_SCAN_ELEMENTS) return true;
-        if ((n & 63) === 0 && performance.now() > end) return false;
+        if (this.tickAdopted >= MAX_ADOPT_PER_TICK) return false;
+        // Reading layout is what costs: look at the clock after every element that did.
+        if ((measured || (++n & 31) === 0) && performance.now() > end) return false;
       }
       return true;
     }
 
+    /**
+     * Attribute changes are queued and applied once per slice: writing between reads would make the next
+     * element's getComputedStyle / getBoundingClientRect recalculate style and layout of the whole page.
+     */
+    flushWrites() {
+      const w = this.writes;
+      if (!w.length) return;
+      this.writes = [];
+      if (!this.enabled) return;
+      for (const [el, name, value] of w) {
+        if (value === null) el.removeAttribute(name);
+        else if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+      }
+    }
+
+    /** @returns {boolean} whether layout was read */
     inspect(el) {
       if (el.shadowRoot) {
-        if (!this.shadowRoots.has(el.shadowRoot)) this.adoptShadow(el.shadowRoot);
+        if (!this.shadowRoots.has(el.shadowRoot)) { this.adoptShadow(el.shadowRoot); this.tickAdopted++; }
       } else if (el.localName.includes('-') && !this.customSeen.has(el) && this.customPending.size < 2000) {
         // Custom elements often attach their shadow root later (lazy definition / upgrade): look again.
         this.customSeen.add(el);
         this.customPending.add(el);
         if (!this.customTimer) this.customTimer = this.win.setTimeout(() => this.recheckCustom(), 1500);
       }
-      if (!this.needElementScan || SKIP_SCAN_TAGS.has(el.nodeName) || el.namespaceURI !== XHTML) return;
+      if (el.namespaceURI !== XHTML) return false;
+      const tag = el.nodeName;
+      if (tag === 'IMG' || tag === 'VIDEO') return this.inspectMedia(el);
+      if (SKIP_SCAN_TAGS.has(tag)) return false;
+      const empty = el.childElementCount === 0 && !el.textContent.trim();
+      if (!this.needElementScan && !empty) return false;
       const cs = this.win.getComputedStyle(el);
+      if (empty && this.isScrim(el, cs)) return true;
+      if (!this.needElementScan) return false;
       const image = cs.backgroundImage;
-      const marked = el.hasAttribute(BG_ATTR);
+      const mark = el.getAttribute(BG_ATTR);
       if (image === 'none' || !image.includes('url(')) {
-        if (marked) el.removeAttribute(BG_ATTR);
-        return;
+        if (mark === '') this.writes.push([el, BG_ATTR, null]);
+        return false;
       }
-      if (marked || cs.filter !== 'none') return; // already handled by a CSS rule (or the page filters it)
+      if (mark !== null || cs.filter !== 'none') return false; // already handled by a CSS rule (or the page filters it)
       const r = el.getBoundingClientRect();
-      if (r.height > this.win.innerHeight * 1.5) return; // page-sized wrappers are backgrounds, not photos
+      if (r.height > this.win.innerHeight * 1.5) return true; // page-sized wrappers are backgrounds, not photos
       if (isPhotoBackground({ image, size: cs.backgroundSize, repeat: cs.backgroundRepeat }, { w: r.width, h: r.height })) {
-        el.setAttribute(BG_ATTR, '');
+        this.writes.push([el, BG_ATTR, '']);
       }
+      return true;
+    }
+
+    /**
+     * A photo or video that covers its box (hero banners: an <img> layer with a text layer on top). The
+     * text would go through the page inversion while the picture keeps its colours, so white headlines
+     * turn dark on a dark photo. Re-invert the box instead, like a CSS background photo: the media inside
+     * gets filter:none from the nesting guard, and everything drawn over it keeps its designed colours.
+     */
+    inspectMedia(media) {
+      if (media.nodeName === 'IMG' && SVG_SRC_RE.test(media.getAttribute('src') || '')) return false;
+      const { doc, win } = this;
+      const r = media.getBoundingClientRect();
+      if (r.width < 100 || r.height < 80) return true;
+      const body = doc.body, html = doc.documentElement;
+      let child = media, p = media.parentElement;
+      for (let depth = 0; p && p !== body && p !== html && depth < 6; depth++, child = p, p = p.parentElement) {
+        if (p.hasAttribute(BG_ATTR)) return true;
+        // Wrappers holding nothing but the media (<picture>, <a>, …) say nothing: look further up.
+        if (onlyWraps(p, child)) continue;
+        const pr = p.getBoundingClientRect();
+        const area = pr.width * pr.height;
+        if (!area) continue; // display: contents
+        if (pr.height > win.innerHeight * 1.5 || overlap(r, pr) < area * 0.9) return true;
+        this.writes.push([p, BG_ATTR, 'cover']);
+        return true;
+      }
+      return true;
+    }
+
+    /**
+     * Modal / consent backdrops dim the page with translucent black. Under the page inversion that turns
+     * into a white haze; re-inverting the layer makes it dim the dark page as designed (like ::backdrop).
+     */
+    isScrim(el, cs) {
+      const pos = cs.position;
+      if (pos !== 'fixed' && pos !== 'absolute') return false;
+      const c = this.color(cs.backgroundColor);
+      if (!c || c[3] === 0 || luminance(c) > 0.03) return false;
+      if (c[3] >= 0.95 && Number(cs.opacity) >= 0.95) return false; // an opaque black layer, not a scrim
+      const r = el.getBoundingClientRect();
+      const vw = this.doc.documentElement.clientWidth || this.win.innerWidth;
+      if (r.width < vw * 0.9 || r.height < this.win.innerHeight * 0.9) return false;
+      if (!el.hasAttribute(SCRIM_ATTR)) this.writes.push([el, SCRIM_ATTR, '']);
+      return true;
     }
 
     recheckCustom() {
@@ -705,10 +908,13 @@
       const els = [...this.customPending];
       this.customPending.clear();
       const retry = [];
+      let found = false;
       for (const el of els) {
-        if (el.shadowRoot) { if (!this.shadowRoots.has(el.shadowRoot)) this.adoptShadow(el.shadowRoot); }
+        // Adopted by the next idle ticks (a bounded number per tick).
+        if (el.shadowRoot) { if (!this.shadowRoots.has(el.shadowRoot) && this.pendingRoots.size < MAX_PENDING_ROOTS) { this.pendingRoots.add(el); found = true; } }
         else if (!this.customRetried.has(el) && el.isConnected) { this.customRetried.add(el); retry.push(el); }
       }
+      if (found) this.schedule(NEW_CONTENT_MS);
       if (retry.length) {
         for (const el of retry) this.customPending.add(el);
         if (!this.customTimer) this.customTimer = this.win.setTimeout(() => this.recheckCustom(), 6000);
@@ -719,18 +925,51 @@
     adoptShadow(sr) {
       this.shadowRoots.add(sr);
       try {
-        const st = this.doc.createElement('style');
-        st.id = STYLE_ID;
-        st.media = this.mediaQuery();
-        const targets = BASE_TARGETS;
-        st.textContent = `${targets.join(',')}{filter:${INVERT}${IMP}}` +
-          `:is(${CONTAINERS.join(',')}) :is(${targets.join(',')}){filter:none${IMP}}`;
-        sr.appendChild(st);
-        this.shadowStyles.add(st);
+        const text = `${BASE_TARGETS.join(',')}{filter:${INVERT}${IMP}}${guardRule(CONTAINERS, BASE_TARGETS)}`;
+        // Left behind by an instance whose script context is gone.
+        for (const old of sr.querySelectorAll(`style#${STYLE_ID}`)) old.remove();
+        let ref = null;
+        if (!this.shadowSheet) {
+          const st = this.doc.createElement('style');
+          st.id = STYLE_ID;
+          st.setAttribute('data-dark', 'engine');
+          st.media = this.mediaQuery();
+          st.textContent = text;
+          sr.appendChild(st);
+          if (st.sheet) ref = st;
+          else st.remove(); // blocked by the page CSP
+        }
+        if (!ref) {
+          if (!this.shadowSheet) {
+            this.shadowSheet = new this.win.CSSStyleSheet({ media: this.mediaQuery() });
+            this.shadowSheet.replaceSync(text);
+          }
+          sr.adoptedStyleSheets = [...sr.adoptedStyleSheets, this.shadowSheet];
+          ref = sr;
+        }
+        this.trackShadow(ref);
         const w = this.doc.createTreeWalker(sr, 1);
         let el;
         while ((el = w.nextNode())) if (el.shadowRoot && !this.shadowRoots.has(el.shadowRoot)) this.adoptShadow(el.shadowRoot);
       } catch { /* closed or exotic root */ }
+    }
+
+    /** Remembers what to undo on disable() without keeping detached shadow trees alive. */
+    trackShadow(target) {
+      if (!WeakRefImpl) { this.shadowRefs.push(target); return; } // very old engines: strong refs
+      this.shadowRefs.push(new WeakRefImpl(target));
+      if (this.shadowRefs.length > this.pruneAt) {
+        this.shadowRefs = this.shadowRefs.filter(r => r.deref());
+        this.pruneAt = Math.max(256, this.shadowRefs.length * 2);
+      }
+    }
+
+    unstyleShadow(target) {
+      if (!target) return;
+      try {
+        if (target.nodeName === 'STYLE') target.remove();
+        else target.adoptedStyleSheets = target.adoptedStyleSheets.filter(s => s !== this.shadowSheet);
+      } catch { /* gone */ }
     }
 
     // ---------------------------------------------------------------- native dark detection
@@ -764,8 +1003,9 @@
         const s = cs(el);
         const img = s.backgroundImage;
         if (img && img !== 'none' && img.includes('gradient')) {
-          const stops = img.match(/rgba?\([^)]*\)|#[0-9a-f]{3,8}\b/gi) || [];
-          const cols = stops.map(x => this.color(x)).filter(c => c && c[3] >= 0.5);
+          const stops = (img.match(/rgba?\([^)]*\)|#[0-9a-f]{3,8}\b/gi) || []).map(x => this.color(x)).filter(Boolean);
+          // A gradient that fades to transparent is an overlay (a scrim over a photo), not a background.
+          const cols = stops.some(c => c[3] < 0.5) ? [] : stops;
           if (cols.length) return cols.reduce((a, c) => a + luminance(c), 0) / cols.length;
         }
         if (el === html && CANVAS_COMPUTED.includes(s.backgroundColor)) return null; // our own canvas fix
@@ -774,15 +1014,22 @@
         return null;
       };
 
-      let canvasLum = paint(html);
-      let canvasExplicit = canvasLum !== null;
-      if (canvasLum === null) { canvasLum = paint(body); canvasExplicit = canvasLum !== null; }
-      if (canvasLum === null) canvasLum = schemeDark ? 0.01 : 1;
-      const canvasDark = canvasLum < DARK_LUM;
-
       const vw = html.clientWidth || win.innerWidth, vh = win.innerHeight;
       const docH = Math.max(html.scrollHeight, body.scrollHeight, vh);
       const partial = doc.readyState === 'loading';
+
+      let canvasLum = paint(html);
+      const bodyLum = paint(body);
+      if (canvasLum !== null && bodyLum !== null) {
+        // html's colour only shows as overscroll when an opaque body covers the whole document (while
+        // the parser runs, the body has not grown to its final height yet).
+        const br = body.getBoundingClientRect();
+        if (br.width >= vw * 0.9 && (partial || br.height >= docH * 0.9)) canvasLum = bodyLum;
+      }
+      if (canvasLum === null) canvasLum = bodyLum;
+      const canvasExplicit = canvasLum !== null;
+      if (canvasLum === null) canvasLum = schemeDark ? 0.01 : 1;
+      const canvasDark = canvasLum < DARK_LUM;
       const skipFixed = new Map();
       // Translucent overlays, cookie banners and other small fixed boxes say nothing about the page.
       const inSmallFixed = el => {
@@ -852,7 +1099,7 @@
       return e;
     },
     defaults: DEFAULTS,
-    util: { rootFilter, clampParams, splitSelectors, subjectCompound, usableSelector, isPhotoBackground, parseColor, luminance, MEDIA },
+    util: { rootFilter, clampParams, splitSelectors, subjectCompound, usableSelector, isPhotoBackground, parseColor, luminance, guardRule, MEDIA, TOP_LAYER },
   };
 
   Object.defineProperty(global, 'DarkEngine', { value: Object.freeze(DarkEngine), configurable: true, writable: false });
@@ -902,6 +1149,7 @@
 
   let started = false;        // nothing happens before auto-init or the first API call
   let manual = null;          // null: follow the OS theme; true / false: set by a call
+  let forced = false;         // an explicit "on" call: darken even a page that looks natively dark
   let nativeDetected = false; // the page ships its own dark theme
   let reason = 'idle';
   let lastSystem = null;      // OS theme seen by the last decision
@@ -917,8 +1165,8 @@
     return p;
   };
   const wanted = () => (manual !== null ? manual : !!config.followSystem && systemDark());
-  /** The state callers see: nothing is dark before the controller started (auto: false). */
-  const current = () => started && wanted();
+  /** The state callers see: whether the page is being darkened (never before the controller started). */
+  const current = () => started && engine.isEnabled();
 
   function looksNativeDark() {
     if (!doc.body) return false;
@@ -930,22 +1178,25 @@
     if (!started) return;
     lastSystem = systemDark();
     const want = wanted();
-    if (want && recheck && config.detectDark && !nativeDetected && looksNativeDark()) nativeDetected = true;
-    const on = want && !(config.detectDark && nativeDetected);
+    const respectNative = config.detectDark && !(forced && manual === true);
+    if (want && recheck && respectNative && !nativeDetected && looksNativeDark()) nativeDetected = true;
+    const on = want && !(respectNative && nativeDetected);
     reason = on ? (manual !== null ? 'manual' : 'system')
       : want ? 'native-dark'
       : manual !== null ? 'manual' : config.followSystem ? 'system' : 'off';
     if (on) {
+      // On a page whose CSP blocks inline styles, in an engine without constructable stylesheets
+      // (iOS < 16.4), the engine stays blocked: isEnabled() is false and state().reason 'csp-blocked'.
       if (engine.isEnabled()) engine.update(params());
       else engine.enable(params());
-    } else if (engine.isEnabled()) {
+    } else if (engine.isEnabled() || engine.isBlocked()) {
       engine.disable();
     }
   }
 
   /** Runs at each stage of the page load: themes can appear late (scripts, async stylesheets). */
   function detect() {
-    if (!started || nativeDetected || !config.detectDark || !wanted()) return;
+    if (!started || nativeDetected || !config.detectDark || (forced && manual === true) || !wanted()) return;
     if (looksNativeDark()) {
       nativeDetected = true;
       apply(false);
@@ -984,7 +1235,7 @@
   function onSchemeChange() {
     if (!started || systemDark() === lastSystem) return; // WebKit's late first 'change' is not a change
     // v1 behaviour: the OS theme wins over an earlier manual toggle while following the system.
-    if (config.followSystem) manual = null;
+    if (config.followSystem) { manual = null; forced = false; }
     // Sites whose own theme follows the OS may have switched with it: look again once their scripts ran.
     nativeDetected = false;
     apply(true);
@@ -1011,16 +1262,18 @@
   }
 
   function setFollow(on) {
-    if (on) manual = null;
+    if (on) { manual = null; forced = false; }
     else if (manual === null) manual = wanted(); // keep what the page looks like right now
     config.followSystem = on;
   }
 
+  /** An explicit call: `true` darkens the page even if it looks natively dark (v1 always did). */
   function set(on) {
     start();
     manual = !!on;
+    forced = !!on;
     apply(true);
-    return wanted();
+    return current();
   }
 
   const DarkJS = {
@@ -1037,7 +1290,7 @@
       return DarkJS;
     },
     /** Whether the page is being darkened right now (false on a page that is dark by itself). */
-    isEnabled() { return engine.isEnabled(); },
+    isEnabled() { return started && engine.isEnabled(); },
     /** Follow the OS theme (true), or keep the current state regardless of it (false). */
     followSystem(on) {
       setFollow(on === undefined ? true : !!on);
@@ -1047,9 +1300,10 @@
     },
     state() {
       return {
-        enabled: engine.isEnabled(), wanted: current(), nativeDark: nativeDetected,
+        enabled: current(), wanted: started && wanted(), nativeDark: nativeDetected,
         systemDark: systemDark(), followSystem: !!config.followSystem, detectDark: !!config.detectDark,
-        params: params(), reason,
+        // Enabling may complete later (WebKit at document start mounts once <html> exists).
+        params: params(), reason: engine.isBlocked() ? 'csp-blocked' : reason,
       };
     },
     engine,
