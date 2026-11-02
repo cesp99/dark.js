@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="color-scheme" content="light dark"><title>Follows prefers-color-scheme</title>
+<style>
+  body{margin:0;background:#ffffff;color:#111;font:16px/1.5 system-ui,sans-serif} main{padding:24px} #text-block{width:400px;height:80px}
+  /* Like many sites on iOS: a native dark theme behind the media query. */
+  @media (prefers-color-scheme: dark){body{background:#0f1b2d;color:#e8eef7}}
+</style></head>
+<body><main><h1>Auto theme</h1><p id="text-block">This page has its own dark theme when the OS is dark; it must not be inverted then.</p><div style="height:900px"></div></main></body></html>

@@ -1,0 +1,6 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Theme applied after load</title>
+<style>body{margin:0;background:#fff;color:#111;font:16px system-ui} html.dark body{background:#111316;color:#ddd} main{padding:24px;height:1200px}</style>
+</head><body><main><h1>Late theme</h1><p>A theme script switches to dark shortly after load.</p></main>
+<script>addEventListener('load', function () { setTimeout(function () { document.documentElement.classList.add('dark'); }, 400); });</script>
+</body></html>

@@ -1,0 +1,21 @@
+{
+  "name": "dark.js",
+  "version": "2.0.0",
+  "private": true,
+  "description": "A lightweight script that forces dark mode on websites that don't natively support it.",
+  "license": "GPL-3.0",
+  "type": "module",
+  "main": "dark.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "npm run build && node tests/run.mjs",
+    "test:legacy": "node tests/run.mjs --legacy",
+    "baseline": "npm run build && node tests/baseline.mjs",
+    "sync-engine": "node scripts/sync-engine.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.64.1",
+    "pngjs": "^7.0.0",
+    "terser": "^5.51.2"
+  }
+}

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Light fixture</title>
+<style>
+  html,body{margin:0;background:#ffffff;color:#111111;font:16px/1.5 system-ui,sans-serif}
+  main{padding:24px}
+  #photo{display:block;width:120px;height:120px}
+  #hero{width:200px;height:120px;background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120"><rect width="120" height="120" fill="%23e01010"/></svg>');background-size:cover}
+  #blue-panel{width:200px;height:60px;background:#1565c0;color:#fff;padding:8px}
+  #text-block{width:400px;height:80px}
+</style></head>
+<body>
+<script>
+  // Records whether dark mode was already active while the page was still parsing (flash-of-white check).
+  window.__earlyDark = (function(){
+    var f = getComputedStyle(document.documentElement).filter;
+    return (f && f !== 'none') || !!document.querySelector('style[id*="dark"]');
+  })();
+</script>
+<main>
+  <h1>Light page</h1>
+  <p id="text-block">The quick brown fox jumps over the lazy dog. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>
+  <p><a href="#x">A link</a> <button>Button</button> <input value="input"></p>
+  <img id="photo" alt="photo" src='data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120"><rect width="120" height="120" fill="%23e01010"/></svg>'>
+  <div id="hero"></div>
+  <div id="blue-panel">Blue panel</div>
+  <div style="height:600px"></div>
+</main>
+</body></html>

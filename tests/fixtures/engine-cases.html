@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Engine cases</title>
+<!-- Served by tests/lib.mjs ({{XO}} = a cross-origin base URL) (needs real text/css MIME types for the stylesheets). -->
+<link rel="stylesheet" href="engine-cases.css">
+<link rel="stylesheet" href="{{XO}}/engine-cases-xo.css">
+<style>
+  html,body{margin:0;background:#fff;color:#111;font:15px/1.4 system-ui,sans-serif}
+  header{position:fixed;top:0;left:0;right:0;height:40px;background:#c62828;color:#fff;z-index:5;padding:8px 16px;box-sizing:border-box}
+  main{padding:56px 16px 16px;display:grid;grid-template-columns:repeat(4,200px);gap:16px}
+  .box{width:200px;height:110px}
+  #gradient{background:linear-gradient(#ffffff,#f0f0f0)}
+  dialog{background:#fff;color:#111;border:0;width:260px;height:80px;margin:0;top:auto;bottom:20px;left:20px;position:fixed}
+  #fs{background:#fff;padding:8px}
+  #fs img{width:100px;height:60px}
+  .tall{height:1600px}
+</style></head>
+<body>
+<header id="fixed">Fixed header</header>
+<main>
+  <div id="class-bg" class="box photo-bg">class bg</div>
+  <div id="inline-bg" class="box" style="background-image:url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGklEQVR4AWN8ICDwnwEJMDGgASYGNMDEgAYAg+QCBygajHwAAAAASUVORK5CYII=');background-size:cover">inline bg</div>
+  <div id="nested" class="box photo-bg"><img id="nested-img" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGklEQVR4AWN8ICDwnwEJMDGgASYGNMDEgAYAg+QCBygajHwAAAAASUVORK5CYII=" style="width:80px;height:60px;margin:20px"></div>
+  <div id="xo-bg" class="box xo-photo">cross-origin bg</div>
+  <div id="gradient" class="box">gradient</div>
+  <div id="icon" class="box icon-bg">icon bg</div>
+  <div id="slot-late"></div>
+  <div id="slot-cij"></div>
+  <x-card id="shadow"></x-card>
+  <x-lazy id="lazy"></x-lazy>
+  <div id="fs"><img id="fs-img" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGklEQVR4AWN8ICDwnwEJMDGgASYGNMDEgAYAg+QCBygajHwAAAAASUVORK5CYII="></div>
+  <svg id="svg-image" width="200" height="110"><image href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGklEQVR4AWN8ICDwnwEJMDGgASYGNMDEgAYAg+QCBygajHwAAAAASUVORK5CYII=" width="200" height="110" preserveAspectRatio="none"/></svg>
+  <video id="vid" poster="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGklEQVR4AWN8ICDwnwEJMDGgASYGNMDEgAYAg+QCBygajHwAAAAASUVORK5CYII=" width="200" height="110"></video>
+  <button id="vid-btn" onclick="document.getElementById('vid').requestFullscreen()">video fullscreen</button>
+  <button id="fs-btn" onclick="document.getElementById('fs').requestFullscreen()">fullscreen</button>
+</main>
+<dialog id="dlg">modal dialog (white)</dialog>
+<div class="tall"></div>
+<script>
+  customElements.define('x-card', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = '<img id="sh-img" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGklEQVR4AWN8ICDwnwEJMDGgASYGNMDEgAYAg+QCBygajHwAAAAASUVORK5CYII=" style="width:200px;height:110px;display:block">'; }
+  });
+  // Defined after load: its shadow root appears long after the element was parsed.
+  addEventListener('load', function () {
+    setTimeout(function () {
+      customElements.define('x-lazy', class extends HTMLElement {
+        connectedCallback() { if (!this.shadowRoot) this.attachShadow({ mode: 'open' }).innerHTML = '<img id="lazy-img" src="' + RED + '" style="width:200px;height:110px;display:block">'; }
+      });
+    }, 300);
+  });
+  window.RED = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAGklEQVR4AWN8ICDwnwEJMDGgASYGNMDEgAYAg+QCBygajHwAAAAASUVORK5CYII=';
+  // Content added later, like an SPA: an inline-styled card and a CSS-in-JS rule inserted via CSSOM.
+  setTimeout(function () {
+    var d = document.createElement('div');
+    d.id = 'late-bg'; d.className = 'box';
+    d.style.cssText = 'background-image:url(' + RED + ');background-size:cover';
+    document.getElementById('slot-late').appendChild(d);
+    var s = document.createElement('style'); document.head.appendChild(s);
+    s.sheet.insertRule('.cij-photo{background:url(' + RED + ') center/cover no-repeat}', 0);
+    var c = document.createElement('div'); c.id = 'cij-bg'; c.className = 'box cij-photo';
+    document.getElementById('slot-cij').appendChild(c);
+  }, 1200);
+</script>
+</body></html>
